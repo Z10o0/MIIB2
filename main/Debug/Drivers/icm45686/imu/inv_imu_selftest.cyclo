@@ -1,0 +1,5 @@
+../Drivers/icm45686/imu/inv_imu_selftest.c:30:5:inv_imu_selftest_init_params	1
+../Drivers/icm45686/imu/inv_imu_selftest.c:44:5:inv_imu_selftest	3
+../Drivers/icm45686/imu/inv_imu_selftest.c:72:12:set_selftest_parameters	6
+../Drivers/icm45686/imu/inv_imu_selftest.c:98:12:run_internal_selftest	3
+../Drivers/icm45686/imu/inv_imu_selftest.c:139:12:get_selftest_output	11

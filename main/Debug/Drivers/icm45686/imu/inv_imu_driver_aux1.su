@@ -1,0 +1,10 @@
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:22:5:inv_imu_set_aux1_accel_mode	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:34:5:inv_imu_set_aux1_drdy	32	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:48:5:inv_imu_get_aux1_int_status	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:62:5:inv_imu_set_aux1_accel_fsr	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:74:5:inv_imu_get_aux1_accel_fsr	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:85:5:inv_imu_set_aux1_gyro_mode	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:97:5:inv_imu_set_aux1_gyro_fsr	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:109:5:inv_imu_get_aux1_gyro_fsr	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:120:5:inv_imu_get_aux1_register_data	24	static
+../Drivers/icm45686/imu/inv_imu_driver_aux1.c:130:5:inv_imu_set_aux1_pin_config_int	24	static

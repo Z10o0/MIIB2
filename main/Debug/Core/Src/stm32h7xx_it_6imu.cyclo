@@ -1,0 +1,15 @@
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:2161:26:LL_DMA_IsActiveFlag_TC0	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:2249:26:LL_DMA_IsActiveFlag_TE0	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:2601:22:LL_DMA_ClearFlag_TC0	1
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:2689:22:LL_DMA_ClearFlag_TE0	1
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:2950:26:LL_USART_IsActiveFlag_FE	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:2961:26:LL_USART_IsActiveFlag_NE	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:2972:26:LL_USART_IsActiveFlag_ORE	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:2998:26:LL_USART_IsActiveFlag_RXNE_RXFNE	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3290:22:LL_USART_ClearFlag_FE	1
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3301:22:LL_USART_ClearFlag_NE	1
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3312:22:LL_USART_ClearFlag_ORE	1
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3911:26:LL_USART_IsEnabledIT_RXNE_RXFNE	2
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:4252:25:LL_USART_ReceiveData8	1
+../Core/Src/stm32h7xx_it_6imu.c:15:6:DMA1_Stream0_IRQHandler	3
+../Core/Src/stm32h7xx_it_6imu.c:32:6:UART4_IRQHandler	10
