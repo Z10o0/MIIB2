@@ -8,6 +8,23 @@
  *          UART4: f_uart=192 МГц, oversampling=8, BRR=2 → 12 МБит/с
  *   PLL3:  PLL3Q  =  40 МГц (M=5, N=32, Q=4) — источник SPI6
  *          SPI6:  DIV2 → 20 МГц SCK
+ *
+ * ИСПРАВЛЕНИЯ v4:
+ *   1. Main loop: убран вызов inv_imu_adv_get_data_from_fifo() —
+ *      эта функция пытается читать FIFO через transport (polling),
+ *      конкурируя с уже запущенным BDMA и вызывая коллизию на шине.
+ *      Вместо этого используется SPI6_PollSensor(i), которая:
+ *        a) читает FIFO_COUNT через polling (быстро, 2 байта),
+ *        b) читает FIFO_DATA через BDMA (эффективно),
+ *        c) вызывает parse → sensor_event_cb → imu_buf.
+ *
+ *   2. cb_current_imu устанавливается ВНУТРИ poll_done_cb (в spi6_imu_port.c)
+ *      до вызова inv_imu_adv_parse_fifo_data. В main loop он используется
+ *      только для обратной совместимости с sensor_event_cb.
+ *
+ *   3. g_device_mode инициализируется MODE_IDLE и управляется UART RX ISR —
+ *      логика не изменилась, но добавлен комментарий что данные не идут
+ *      пока не получена команда 'R' или 'C'.
  */
 
 #include "main.h"
@@ -91,14 +108,18 @@ static volatile uint32_t imu_sample_cnt[IMU_COUNT];
 
 /* ── IMU state ───────────────────────────────────────────────────── */
 static inv_imu_device_t  imu_dev[IMU_COUNT];
-static uint8_t           fifo_buf[IMU_COUNT][FIFO_MIRRORING_SIZE];
 
-/* cb_current_imu: устанавливается перед вызовом parse_fifo_data,
- * читается внутри sensor_event_cb для идентификации датчика.
- * Потокобезопасно: всё в одном потоке (main loop). */
-static volatile uint8_t  cb_current_imu = 0U;
+/* cb_current_imu: устанавливается в spi6_imu_port.c внутри poll_done_cb
+ * перед вызовом inv_imu_adv_parse_fifo_data → sensor_event_cb.
+ * Объявлен volatile, читается только внутри sensor_event_cb. */
+volatile uint8_t  cb_current_imu = 0U;
 
+/* g_device_mode = MODE_IDLE — данные не идут по UART.
+ * Отправить 'R' (0x52) по UART4 RX чтобы начать поток raw-пакетов.
+ * Отправить 'C' (0x43) для калиброванных пакетов.
+ * Отправить 'S' (0x53) чтобы остановить. */
 volatile device_mode_t g_device_mode = MODE_IDLE;
+
 volatile uint32_t dma_start_cnt = 0U;
 volatile uint32_t dma_tc_cnt    = 0U;
 
@@ -118,10 +139,8 @@ static void process_sample_cal(const icm6_raw_sample_t *s);
 /* ════════════════════════════════════════════════════════════════════
  * sensor_event_cb
  *
- * ИСПРАВЛЕНО: убраны event->driver->adv_var и adv->user_context —
- * этих полей нет в inv_imu_sensor_event_t текущей версии SDK.
- * Индекс датчика берётся из cb_current_imu, который устанавливается
- * перед каждым вызовом inv_imu_adv_get_data_from_fifo().
+ * Вызывается из inv_imu_adv_parse_fifo_data внутри poll_done_cb (ISR).
+ * cb_current_imu установлен в poll_done_cb до вызова parse.
  * ════════════════════════════════════════════════════════════════════ */
 static void sensor_event_cb(inv_imu_sensor_event_t *event)
 {
@@ -297,18 +316,19 @@ int main(void)
 
     while (1)
     {
-        /* ── Опрос 6 датчиков через FIFO ─────────────────────────── */
+        /* ── Опрос 6 датчиков через FIFO (BDMA) ──────────────────── */
+        /* ИСПРАВЛЕНО: используем SPI6_PollSensor вместо
+         * inv_imu_adv_get_data_from_fifo, которая читает через
+         * transport (polling) и конкурирует с BDMA на шине SPI6.
+         * SPI6_PollSensor:
+         *   1) читает FIFO_COUNT (2 байта, polling — быстро),
+         *   2) читает FIFO_DATA через BDMA (эффективно),
+         *   3) вызывает inv_imu_adv_parse_fifo_data → sensor_event_cb
+         *      → заполняет imu_buf[i]. */
         for (uint8_t i = 0U; i < IMU_COUNT; i++)
         {
-            uint16_t fifo_count = 0U;
             cb_current_imu = i;
-            if (inv_imu_adv_get_data_from_fifo(&imu_dev[i],
-                    fifo_buf[i], &fifo_count) == 0)
-            {
-                if (fifo_count > 0U)
-                    inv_imu_adv_parse_fifo_data(&imu_dev[i],
-                        fifo_buf[i], fifo_count);
-            }
+            SPI6_PollSensor(i);
         }
 
         /* ── Отправка по UART ─────────────────────────────────────── */
@@ -436,7 +456,7 @@ static void MX_UART4_Init(void)
     LL_USART_SetRXFIFOThreshold(UART4, LL_USART_FIFOTHRESHOLD_1_8);
     LL_USART_ConfigAsyncMode(UART4);
     LL_USART_EnableDMAReq_TX(UART4);
-    LL_USART_EnableIT_RXNE(UART4);
+    LL_USART_EnableIT_RXNE_RXFNE(UART4);
     LL_USART_Enable(UART4);
     while ((!LL_USART_IsActiveFlag_TEACK(UART4)) ||
            (!LL_USART_IsActiveFlag_REACK(UART4))) {}

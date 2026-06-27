@@ -1,4 +1,14 @@
-/* Core/Src/stm32h7xx_it_6imu.c */
+/* Core/Src/stm32h7xx_it_6imu.c
+ *
+ * Исправления:
+ *   - UART4_IRQHandler: заменён LL_USART_IsActiveFlag_RXNE /
+ *     LL_USART_IsEnabledIT_RXNE на _RXNE_RXFNE версии.
+ *     На STM32H7 (SPIv2/USARTv3) флаг RXNE объединён с RXFNE
+ *     в единый макрос RXNE_RXFNE. Старое имя RXNE не работает
+ *     при отключённом FIFO — условие никогда не выполнялось и
+ *     команды с ПЛИС игнорировались.
+ *   - Аналогично EnableIT_RXNE → EnableIT_RXNE_RXFNE в main_6imu.c
+ */
 
 #include "main.h"
 #include "spi6_imu_port.h"
@@ -9,7 +19,6 @@ extern volatile uint8_t  uart_tx_busy;
 extern volatile uint32_t dma_tc_cnt;
 extern volatile device_mode_t g_device_mode;
 
-/* UART4_TryStartDMA объявлена в main_6imu.c — вызываем из ISR */
 extern void UART4_TryStartDMA(void);
 
 /* ── UART4 TX DMA ────────────────────────────────────────────────── */
@@ -20,7 +29,7 @@ void DMA1_Stream0_IRQHandler(void)
         LL_DMA_ClearFlag_TC0(DMA1);
         LL_DMA_DisableStream(DMA1, LL_DMA_STREAM_0);
         dma_tc_cnt++;
-        tx_tail = (tx_tail + 1U) % 256U;   /* 256 = TX_BUF_SZ6 */
+        tx_tail = (tx_tail + 1U) % 256U;
         uart_tx_busy = 0U;
         UART4_TryStartDMA();
     }
@@ -35,8 +44,11 @@ void DMA1_Stream0_IRQHandler(void)
 /* ── UART4 RX ────────────────────────────────────────────────────── */
 void UART4_IRQHandler(void)
 {
-    if (LL_USART_IsActiveFlag_RXNE(UART4) &&
-        LL_USART_IsEnabledIT_RXNE(UART4))
+    /* ИСПРАВЛЕНО: _RXNE_RXFNE вместо _RXNE
+     * На STM32H7 при DisableFIFO флаг RXNE называется RXNE_RXFNE.
+     * Проверка IsEnabledIT убрана — она была лишней и проверяла
+     * неправильный бит CR1_RXNEIE вместо CR1_RXFNEIE. */
+    if (LL_USART_IsActiveFlag_RXNE_RXFNE(UART4))
     {
         uint8_t cmd = LL_USART_ReceiveData8(UART4);
         switch (cmd)

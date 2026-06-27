@@ -10,9 +10,8 @@
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3290:22:LL_USART_ClearFlag_FE	16	static
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3301:22:LL_USART_ClearFlag_NE	16	static
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3312:22:LL_USART_ClearFlag_ORE	16	static
-../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:3911:26:LL_USART_IsEnabledIT_RXNE_RXFNE	16	static
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_usart.h:4252:25:LL_USART_ReceiveData8	16	static
-../Core/Src/stm32h7xx_it_6imu.c:16:6:DMA1_Stream0_IRQHandler	8	static
-../Core/Src/stm32h7xx_it_6imu.c:36:6:UART4_IRQHandler	16	static
-../Core/Src/stm32h7xx_it_6imu.c:56:6:BDMA_Channel1_IRQHandler	8	static
-../Core/Src/stm32h7xx_it_6imu.c:57:6:BDMA_Channel0_IRQHandler	8	static
+../Core/Src/stm32h7xx_it_6imu.c:25:6:DMA1_Stream0_IRQHandler	8	static
+../Core/Src/stm32h7xx_it_6imu.c:45:6:UART4_IRQHandler	16	static
+../Core/Src/stm32h7xx_it_6imu.c:68:6:BDMA_Channel1_IRQHandler	8	static
+../Core/Src/stm32h7xx_it_6imu.c:69:6:BDMA_Channel0_IRQHandler	8	static
