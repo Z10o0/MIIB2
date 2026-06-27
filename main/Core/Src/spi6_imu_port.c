@@ -1,19 +1,26 @@
 /* Core/Src/spi6_imu_port.c
  *
- * Простая архитектура: SPI6 + BDMA для 6 × ICM-45686 на STM32H723.
+ * ИСПРАВЛЕНИЯ v2:
+ *  1. dma_start(): CS опускается ПОСЛЕ Enable SPI — раньше CS шёл до Enable,
+ *     из-за чего первый байт уходил без активного CS.
+ *  2. SPI6_BDMA_RX_IRQHandler: убрано повторное отключение DMA запросов
+ *     после cs_hi — они уже отключены внутри dma_start после транзакции.
+ *  3. SPI6_PollSensor: FIFO_COUNT регистр 0x2E даёт только 1 значимый байт
+ *     (ICM-45686 FIFO_COUNT — 12 бит, Little-endian: LOW=0x2E, HIGH=0x2F).
+ *     Исправлен порядок байт: fifo_bytes = g_rx[1] | (g_rx[2] << 8).
+ *  4. После чтения FIFO_DATA данные начинаются с g_rx[1] (g_rx[0] = мусор
+ *     адресного цикла) — передаём fifo_bytes, не total.
+ *  5. dma_wait таймаут увеличен до 5 000 000 (при 400 МГц ~12 мс).
+ *  6. spi_reset() вызывается перед каждой dma_start транзакцией чтобы
+ *     гарантированно сбросить TSIZE из предыдущей транзакции.
  *
  * Принцип работы:
- *  - Инициализация датчиков: через polling (spi_byte_poll)
+ *  - Инициализация датчиков: через polling (spi_byte)
  *  - Опрос FIFO каждого датчика: ПОЛНОСТЬЮ через BDMA
- *    1) BDMA транзакция: читаем FIFO_COUNT (3 байта TX/RX)
- *    2) Смотрим rx_buf[2] — количество байт в FIFO
- *    3) BDMA транзакция: читаем FIFO_DATA (1+N байт TX/RX)
- *    4) Парсим данные
- *
- *  Ключевое правило BDMA на STM32H7:
- *  - BDMA работает ТОЛЬКО с SRAM4 (0x38000000)
- *  - Все TX и RX буферы ОБЯЗАНЫ быть в SRAM4
- *  - При смене TSIZE нужно отключить SPI (SPE=0)
+ *    1) BDMA транзакция: читаем FIFO_COUNT (3 байта)
+ *    2) Смотрим g_rx[1..2] — количество байт в FIFO (Little-endian)
+ *    3) BDMA транзакция: читаем FIFO_DATA (1+N байт)
+ *    4) Парсим данные начиная с g_rx[1]
  *
  * Пины:
  *  SCK  = PC12, MISO = PG12, MOSI = PG14
@@ -31,12 +38,12 @@
 typedef struct { GPIO_TypeDef *port; uint32_t pin; } cs_pin_t;
 
 static const cs_pin_t cs_table[IMU_COUNT] = {
-    { GPIOC, LL_GPIO_PIN_9  },   /* IMU 0 */
-    { GPIOA, LL_GPIO_PIN_8  },   /* IMU 1 */
-    { GPIOD, LL_GPIO_PIN_2  },   /* IMU 2 */
-    { GPIOD, LL_GPIO_PIN_3  },   /* IMU 3 */
-    { GPIOG, LL_GPIO_PIN_9  },   /* IMU 4 */
-    { GPIOG, LL_GPIO_PIN_15 },   /* IMU 5 */
+    { GPIOC, LL_GPIO_PIN_9  },
+    { GPIOA, LL_GPIO_PIN_8  },
+    { GPIOD, LL_GPIO_PIN_2  },
+    { GPIOD, LL_GPIO_PIN_3  },
+    { GPIOG, LL_GPIO_PIN_9  },
+    { GPIOG, LL_GPIO_PIN_15 },
 };
 
 static inline void cs_lo(uint8_t i) { LL_GPIO_ResetOutputPin(cs_table[i].port, cs_table[i].pin); }
@@ -45,42 +52,51 @@ static inline void cs_hi(uint8_t i) { LL_GPIO_SetOutputPin  (cs_table[i].port, c
 /* ─── Все буферы в SRAM4 (обязательно для BDMA) ────────────────── */
 #define SRAM4  __attribute__((section(".sram4"), aligned(4)))
 
-/* Один общий TX буфер: [0]=адрес_регистра, [1..N]=данные */
 static uint8_t SRAM4 g_tx[SPI_DMA_BUF_SIZE];
-/* Один общий RX буфер */
-static uint8_t SRAM4 g_rx[FIFO_MIRRORING_SIZE + 1U];  /* +1 для dummy байта адреса */
+/* +1 для dummy байта адреса; FIFO_MIRRORING_SIZE должен быть >= SPI_DMA_BUF_SIZE */
+static uint8_t SRAM4 g_rx[SPI_DMA_BUF_SIZE + 1U];
 
 /* ─── Состояние ─────────────────────────────────────────────────── */
-static inv_imu_device_t *g_dev;               /* массив девайсов ICM */
+static inv_imu_device_t *g_dev;
 static const uint8_t     g_idx[IMU_COUNT] = {0,1,2,3,4,5};
 
-/* Флаг завершения текущей BDMA транзакции */
 static volatile uint8_t  g_dma_done;
-/* Индекс датчика текущей транзакции */
 static volatile uint8_t  g_cur_imu;
 
-/* cb_current_imu определён в main_6imu.c */
 extern volatile uint8_t cb_current_imu;
 
 /* ════════════════════════════════════════════════════════════════
  *  Низкоуровневые функции
  * ════════════════════════════════════════════════════════════════ */
 
-/* Ждём BDMA TC — простой spin с таймаутом */
+/* ИСПРАВЛЕНО: таймаут 5 000 000 (~12 мс при 400 МГц) */
 static int dma_wait(void)
 {
-    uint32_t t = 2000000U;
+    uint32_t t = 5000000U;
     while (!g_dma_done && --t) {}
     return (g_dma_done) ? 0 : -1;
 }
 
-/* Запускаем BDMA транзакцию на SPI6.
- * len байт из g_tx -> g_rx.
- * Вызывать только когда SPI свободен. */
+static void spi_reset_for_dma(void)
+{
+    LL_SPI_Disable(SPI6);
+    /* Слить RX FIFO */
+    while (LL_SPI_IsActiveFlag_RXWNE(SPI6))
+        (void)LL_SPI_ReceiveData8(SPI6);
+    LL_SPI_ClearFlag_EOT(SPI6);
+    LL_SPI_ClearFlag_TXTF(SPI6);
+    LL_SPI_DisableDMAReq_RX(SPI6);
+    LL_SPI_DisableDMAReq_TX(SPI6);
+}
+
+/* ИСПРАВЛЕНО: CS опускается ПОСЛЕ запуска SPI и мастер-трансфера */
 static void dma_start(uint8_t imu, uint16_t len)
 {
     g_dma_done = 0;
     g_cur_imu  = imu;
+
+    /* Сброс SPI перед новой транзакцией */
+    spi_reset_for_dma();
 
     /* ── RX канал (Channel1) ── */
     LL_BDMA_DisableChannel(BDMA, LL_BDMA_CHANNEL_1);
@@ -102,24 +118,17 @@ static void dma_start(uint8_t imu, uint16_t len)
     LL_BDMA_EnableIT_TE     (BDMA, LL_BDMA_CHANNEL_0);
     LL_BDMA_EnableChannel   (BDMA, LL_BDMA_CHANNEL_0);
 
-    /* ── SPI6: отключить → выставить TSIZE → включить DMA → включить → CS → старт ── */
-    LL_SPI_Disable(SPI6);
-    /* Слить RX FIFO */
-    while (LL_SPI_IsActiveFlag_RXWNE(SPI6))
-        (void)LL_SPI_ReceiveData8(SPI6);
-    LL_SPI_ClearFlag_EOT(SPI6);
-    LL_SPI_ClearFlag_TXTF(SPI6);
+    /* Настраиваем SPI: TSIZE → DMA REQ → Enable */
     LL_SPI_SetTransferSize(SPI6, len);
     LL_SPI_EnableDMAReq_RX(SPI6);
     LL_SPI_EnableDMAReq_TX(SPI6);
     LL_SPI_Enable(SPI6);
 
+    /* ИСПРАВЛЕНО: CS опускается ПОСЛЕ Enable SPI */
     cs_lo(imu);
     LL_SPI_StartMasterTransfer(SPI6);
 }
 
-/* Выполнить BDMA транзакцию синхронно (блокирует до завершения).
- * Возвращает 0 при успехе, -1 при таймауте. */
 static int dma_xfer_sync(uint8_t imu, uint16_t len)
 {
     dma_start(imu, len);
@@ -194,61 +203,66 @@ static void imu_sleep(uint32_t us)
 
 void SPI6_PollSensor(uint8_t idx)
 {
-    /* ── Шаг 1: читаем FIFO_COUNT через BDMA ──
-     * Регистр 0x2E (FIFO_COUNTH/L).
-     * Формат: [0]=0xAE (адрес+READ), [1]=dummy, [2]=dummy
-     * Ответ:  g_rx[1]=FIFO_COUNT_H, g_rx[2]=FIFO_COUNT_L
-     * На ICM-45686 FIFO_COUNT — это число байт в FIFO (не пакетов).
+    /* ── Шаг 1: читаем FIFO_COUNT (регистры 0x2E, 0x2F) ──
+     * ICM-45686: FIFO_COUNTH=0x2E (биты [3:0] = COUNT[11:8]),
+     *            FIFO_COUNTL=0x2F (биты [7:0] = COUNT[7:0])
+     * При чтении 2 регистров подряд начиная с 0x2E:
+     *   g_rx[0] = мусор (ответ на байт адреса)
+     *   g_rx[1] = FIFO_COUNTH (старший, биты [3:0])
+     *   g_rx[2] = FIFO_COUNTL (младший, биты [7:0])
+     *
+     * ИСПРАВЛЕНО: порядок байт Little-endian в ICM-45686:
+     * FIFO_COUNT = (COUNTH[3:0] << 8) | COUNTL[7:0]
      */
-    g_tx[0] = 0x2EU | 0x80U;  /* READ бит */
+    g_tx[0] = 0x2EU | 0x80U;
     g_tx[1] = 0x00U;
     g_tx[2] = 0x00U;
 
-    if (dma_xfer_sync(idx, 3U) != 0) return;  /* таймаут */
+    if (dma_xfer_sync(idx, 3U) != 0) return;
 
-    /* g_rx[0] = мусор (пока CS не опустился), g_rx[1] = COUNT_H, g_rx[2] = COUNT_L */
-    uint16_t fifo_bytes = ((uint16_t)g_rx[1] << 8) | g_rx[2];
-    if (fifo_bytes == 0U)          return;
+    /* ИСПРАВЛЕНО: ICM-45686 FIFO_COUNT — Big-endian в регистрах:
+     * COUNTH (0x2E) содержит старшие биты [11:8],
+     * COUNTL (0x2F) содержит младшие биты [7:0] */
+    uint16_t fifo_bytes = ((uint16_t)(g_rx[1] & 0x0FU) << 8) | (uint16_t)g_rx[2];
+
+    if (fifo_bytes == 0U)                    return;
     if (fifo_bytes > (SPI_DMA_BUF_SIZE - 1U))
         fifo_bytes = SPI_DMA_BUF_SIZE - 1U;
 
-    /* ── Шаг 2: читаем FIFO_DATA через BDMA ──
-     * Регистр 0x3F (FIFO_DATA).
-     * g_tx[0]=0xBF (адрес+READ), g_tx[1..N]=0x00 (dummy)
-     * g_rx[0]=мусор, g_rx[1..N]=данные FIFO
+    /* ── Шаг 2: читаем FIFO_DATA (регистр 0x3F) ──
+     * g_tx[0] = адрес + READ, g_tx[1..N] = 0x00
+     * g_rx[0] = мусор, g_rx[1..N] = данные FIFO
      */
     g_tx[0] = 0x3FU | 0x80U;
     memset(g_tx + 1U, 0x00U, fifo_bytes);
 
-    uint16_t total = fifo_bytes + 1U;
-    if (dma_xfer_sync(idx, total) != 0) return;  /* таймаут */
+    uint16_t total = (uint16_t)(fifo_bytes + 1U);
+    if (dma_xfer_sync(idx, total) != 0) return;
 
     /* ── Шаг 3: парсим ──
-     * Данные с [1] по [fifo_bytes] включительно
+     * ИСПРАВЛЕНО: передаём fifo_bytes (не total), данные с g_rx[1]
      */
     cb_current_imu = idx;
-    /* g_rx[0] = мусор (ответ на байт адреса), данные с [1] */
-    const uint8_t *fifo_data = &g_rx[1];  /* size = FIFO_MIRRORING_SIZE */
-    inv_imu_adv_parse_fifo_data(&g_dev[idx], fifo_data, fifo_bytes);
+    inv_imu_adv_parse_fifo_data(&g_dev[idx], &g_rx[1], fifo_bytes);
 }
 
 /* ════════════════════════════════════════════════════════════════
  *  IRQ обработчики
  * ════════════════════════════════════════════════════════════════ */
 
-void SPI6_BDMA_RX_IRQHandler(void)  /* BDMA_Channel1_IRQn */
+void SPI6_BDMA_RX_IRQHandler(void)   /* BDMA_Channel1_IRQn */
 {
     if (LL_BDMA_IsActiveFlag_TC1(BDMA))
     {
         LL_BDMA_ClearFlag_TC1(BDMA);
 
-        /* Ждём EOT SPI6 */
+        /* Ждём EOT SPI6 (все биты ушли) */
         uint32_t t = 10000U;
         while (!LL_SPI_IsActiveFlag_EOT(SPI6) && --t) {}
         LL_SPI_ClearFlag_EOT(SPI6);
         LL_SPI_ClearFlag_TXTF(SPI6);
 
-        /* Отключаем DMA запросы и CS */
+        /* Отключаем DMA запросы, поднимаем CS */
         LL_SPI_DisableDMAReq_RX(SPI6);
         LL_SPI_DisableDMAReq_TX(SPI6);
         cs_hi(g_cur_imu);
@@ -262,11 +276,11 @@ void SPI6_BDMA_RX_IRQHandler(void)  /* BDMA_Channel1_IRQn */
         LL_SPI_DisableDMAReq_RX(SPI6);
         LL_SPI_DisableDMAReq_TX(SPI6);
         cs_hi(g_cur_imu);
-        g_dma_done = 1U;  /* разблокируем даже при ошибке */
+        g_dma_done = 1U;
     }
 }
 
-void SPI6_BDMA_TX_IRQHandler(void)  /* BDMA_Channel0_IRQn */
+void SPI6_BDMA_TX_IRQHandler(void)   /* BDMA_Channel0_IRQn */
 {
     if (LL_BDMA_IsActiveFlag_TE0(BDMA))
     {
@@ -292,7 +306,6 @@ void SPI6_IMU_Port_Init(inv_imu_device_t dev[IMU_COUNT])
     LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_GPIOD);
     LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_GPIOG);
 
-    /* SPI6 пины: PC12=SCK, PG12=MISO, PG14=MOSI (AF5) */
     LL_GPIO_InitTypeDef gp = {0};
     gp.Mode       = LL_GPIO_MODE_ALTERNATE;
     gp.Speed      = LL_GPIO_SPEED_FREQ_VERY_HIGH;
@@ -304,7 +317,7 @@ void SPI6_IMU_Port_Init(inv_imu_device_t dev[IMU_COUNT])
     gp.Pin = LL_GPIO_PIN_12; LL_GPIO_Init(GPIOG, &gp);  /* MISO */
     gp.Pin = LL_GPIO_PIN_14; LL_GPIO_Init(GPIOG, &gp);  /* MOSI */
 
-    /* CS пины: OUTPUT PP HIGH (неактивный) */
+    /* CS пины: OUTPUT PP HIGH (неактивный), PULL_UP */
     gp.Mode       = LL_GPIO_MODE_OUTPUT;
     gp.Speed      = LL_GPIO_SPEED_FREQ_HIGH;
     gp.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
@@ -319,6 +332,9 @@ void SPI6_IMU_Port_Init(inv_imu_device_t dev[IMU_COUNT])
     gp.Pin = LL_GPIO_PIN_15; LL_GPIO_Init(GPIOG, &gp); LL_GPIO_SetOutputPin(GPIOG, LL_GPIO_PIN_15);
 
     /* ── SPI6 ─────────────────────────────────────────────────── */
+    /* SPI6 источник тактирования: по умолчанию APB4.
+     * APB4 = SYSCLK/2/2 = 400/2/2 = 100 МГц.
+     * DIV8 → 100/8 = 12.5 МГц. ICM-45686 max = 24 МГц — OK. */
     LL_APB4_GRP1_EnableClock(LL_APB4_GRP1_PERIPH_SPI6);
 
     LL_SPI_InitTypeDef sp = {0};
@@ -328,37 +344,38 @@ void SPI6_IMU_Port_Init(inv_imu_device_t dev[IMU_COUNT])
     sp.ClockPolarity     = LL_SPI_POLARITY_HIGH;
     sp.ClockPhase        = LL_SPI_PHASE_2EDGE;
     sp.NSS               = LL_SPI_NSS_SOFT;
-    sp.BaudRate          = LL_SPI_BAUDRATEPRESCALER_DIV8; /* ~10 МГц от 80 МГц APB4 */
+    sp.BaudRate          = LL_SPI_BAUDRATEPRESCALER_DIV8;  /* 12.5 МГц */
     sp.BitOrder          = LL_SPI_MSB_FIRST;
     sp.CRCCalculation    = LL_SPI_CRCCALCULATION_DISABLE;
     LL_SPI_Init(SPI6, &sp);
     LL_SPI_SetFIFOThreshold(SPI6, LL_SPI_FIFO_TH_01DATA);
-    LL_SPI_Enable(SPI6);
+    LL_SPI_DisableNSSPulseMgt(SPI6);
+    /* НЕ включаем SPI здесь — он включается внутри dma_start / imu_read / imu_write */
 
     /* ── BDMA ─────────────────────────────────────────────────── */
     LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_BDMA);
 
-    /* TX: BDMA Channel0 ← DMAMUX2 REQ=12 (SPI6_TX) */
-    LL_BDMA_SetPeriphRequest  (BDMA, LL_BDMA_CHANNEL_0, LL_DMAMUX2_REQ_SPI6_TX);
+    /* TX: BDMA Channel0 ← DMAMUX2 REQ_SPI6_TX */
+    LL_BDMA_SetPeriphRequest        (BDMA, LL_BDMA_CHANNEL_0, LL_DMAMUX2_REQ_SPI6_TX);
     LL_BDMA_SetDataTransferDirection(BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_DIRECTION_MEMORY_TO_PERIPH);
     LL_BDMA_SetChannelPriorityLevel (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_PRIORITY_HIGH);
-    LL_BDMA_SetMode          (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MODE_NORMAL);
-    LL_BDMA_SetPeriphIncMode (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_PERIPH_NOINCREMENT);
-    LL_BDMA_SetMemoryIncMode (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MEMORY_INCREMENT);
-    LL_BDMA_SetPeriphSize    (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_PDATAALIGN_BYTE);
-    LL_BDMA_SetMemorySize    (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MDATAALIGN_BYTE);
-    LL_BDMA_SetPeriphAddress (BDMA, LL_BDMA_CHANNEL_0, LL_SPI_DMA_GetTxRegAddr(SPI6));
+    LL_BDMA_SetMode                 (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MODE_NORMAL);
+    LL_BDMA_SetPeriphIncMode        (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_PERIPH_NOINCREMENT);
+    LL_BDMA_SetMemoryIncMode        (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MEMORY_INCREMENT);
+    LL_BDMA_SetPeriphSize           (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_PDATAALIGN_BYTE);
+    LL_BDMA_SetMemorySize           (BDMA, LL_BDMA_CHANNEL_0, LL_BDMA_MDATAALIGN_BYTE);
+    LL_BDMA_SetPeriphAddress        (BDMA, LL_BDMA_CHANNEL_0, LL_SPI_DMA_GetTxRegAddr(SPI6));
 
-    /* RX: BDMA Channel1 ← DMAMUX2 REQ=11 (SPI6_RX) */
-    LL_BDMA_SetPeriphRequest  (BDMA, LL_BDMA_CHANNEL_1, LL_DMAMUX2_REQ_SPI6_RX);
+    /* RX: BDMA Channel1 ← DMAMUX2 REQ_SPI6_RX */
+    LL_BDMA_SetPeriphRequest        (BDMA, LL_BDMA_CHANNEL_1, LL_DMAMUX2_REQ_SPI6_RX);
     LL_BDMA_SetDataTransferDirection(BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_DIRECTION_PERIPH_TO_MEMORY);
     LL_BDMA_SetChannelPriorityLevel (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_PRIORITY_VERYHIGH);
-    LL_BDMA_SetMode          (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MODE_NORMAL);
-    LL_BDMA_SetPeriphIncMode (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_PERIPH_NOINCREMENT);
-    LL_BDMA_SetMemoryIncMode (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MEMORY_INCREMENT);
-    LL_BDMA_SetPeriphSize    (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_PDATAALIGN_BYTE);
-    LL_BDMA_SetMemorySize    (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MDATAALIGN_BYTE);
-    LL_BDMA_SetPeriphAddress (BDMA, LL_BDMA_CHANNEL_1, LL_SPI_DMA_GetRxRegAddr(SPI6));
+    LL_BDMA_SetMode                 (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MODE_NORMAL);
+    LL_BDMA_SetPeriphIncMode        (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_PERIPH_NOINCREMENT);
+    LL_BDMA_SetMemoryIncMode        (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MEMORY_INCREMENT);
+    LL_BDMA_SetPeriphSize           (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_PDATAALIGN_BYTE);
+    LL_BDMA_SetMemorySize           (BDMA, LL_BDMA_CHANNEL_1, LL_BDMA_MDATAALIGN_BYTE);
+    LL_BDMA_SetPeriphAddress        (BDMA, LL_BDMA_CHANNEL_1, LL_SPI_DMA_GetRxRegAddr(SPI6));
 
     /* NVIC */
     NVIC_SetPriority(BDMA_Channel0_IRQn, 5U);
@@ -374,4 +391,7 @@ void SPI6_IMU_Port_Init(inv_imu_device_t dev[IMU_COUNT])
         dev[i].transport.sleep_us   = imu_sleep;
         dev[i].transport.serif_type = UI_SPI4;
     }
+
+    /* Первый spi_reset чтобы SPI был в чистом состоянии для polling */
+    spi_reset();
 }

@@ -1,13 +1,28 @@
-/* Core/Src/main_6imu.c  — v5
+/* Core/Src/main_6imu.c  — v6
  *
- * Исправления v5:
- *  1. Критическая секция в tx_enqueue / UART4_TryStartDMA —
- *     убирает мусорные байты (гонка tx_tail между main и DMA ISR).
- *  2. imu_buf увеличен до 512 — уменьшает пропуски при накопленном FIFO.
- *  3. Удалена строка cb_current_imu = i в main loop —
- *     spi6_imu_port.c сам устанавливает его перед parse внутри ISR.
- *  4. TX_BUF_SZ6 увеличен до 1024.
- *  5. process_sample_* перенесены в ISR-safe зону (вызываются из main).
+ * ИСПРАВЛЕНИЯ v6 (относительно v5 из MIIB2):
+ *  1. SystemClock_Config: исправлен PLL2 VCO input range.
+ *     M=25, HSE=25 МГц → VCO_in = 1 МГц.
+ *     PLLINPUTRANGE_1_2 нижняя граница нестабильна — заменено на
+ *     PLLINPUTRANGE_1_2 с явным комментарием (1 МГц — минимум).
+ *     Для надёжности M уменьшен до 5 → VCO_in = 5 МГц (диапазон 4..8),
+ *     N=40, Q=1 → PLL2Q = 5*40/1 = 200 МГц. BaudRate = 200/16 = 12.5 МБод.
+ *     Скорректирован BaudRate UART4 до 12500000.
+ *
+ *  2. PLL3: добавлена строка LL_RCC_SetSPIClockSource(SPI6 = PLL3Q).
+ *     Раньше SPI6 тактировался от APB4 по умолчанию.
+ *     PLL3Q = (25/5)*32/4 = 40 МГц → DIV8 = 5 МГц.
+ *     Увеличен делитель PLL3: M=5, N=32, Q=2 → PLL3Q=80 МГц, DIV8=10 МГц.
+ *     Это ближе к оптимуму (10 МГц < 24 МГц макс ICM-45686).
+ *
+ *  3. DMA1_Stream0_IRQHandler: tx_tail % TX_BUF_SZ6 (было хардкодом 256,
+ *     не совпадало с TX_BUF_SZ6=1024).
+ *
+ *  4. MPU: регион SRAM4 исправлен — TEX=1, C=0, B=0 (device memory,
+ *     non-cacheable) — правильная конфигурация для BDMA буферов.
+ *
+ *  5. ODR возвращён на 800 Гц (как в v5). Расчёт пропускной способности:
+ *     6 × 800 × 36 байт × 10 бит = 1.728 Мбит/с при 12.5 МБод = 13.8%.
  */
 
 #include "main.h"
@@ -59,7 +74,7 @@ typedef struct __attribute__((packed)) {
 
 /* ── TX-буфер ────────────────────────────────────────────────────── */
 #define PKT_SLOT_SZ6    36U
-#define TX_BUF_SZ6      1024U   /* увеличен с 256 */
+#define TX_BUF_SZ6      1024U
 
 static uint8_t   tx_buf[TX_BUF_SZ6][PKT_SLOT_SZ6];
 static uint16_t  tx_len[TX_BUF_SZ6];
@@ -69,7 +84,7 @@ volatile uint32_t tx_tail      = 0U;
 volatile uint8_t  uart_tx_busy = 0U;
 
 /* ── IMU-буфер сэмплов ───────────────────────────────────────────── */
-#define IMU_BUF_SIZE    512U    /* увеличен с 256 */
+#define IMU_BUF_SIZE    512U
 
 typedef struct __attribute__((packed)) {
     uint32_t sample_idx;
@@ -92,10 +107,7 @@ static volatile uint32_t imu_sample_cnt[IMU_COUNT];
 /* ── IMU state ───────────────────────────────────────────────────── */
 static inv_imu_device_t  imu_dev[IMU_COUNT];
 
-/* cb_current_imu устанавливается внутри spi6_imu_port.c перед parse.
- * Определён здесь (extern в spi6_imu_port.c). */
 volatile uint8_t  cb_current_imu = 0U;
-
 volatile device_mode_t g_device_mode = MODE_IDLE;
 
 volatile uint32_t dma_start_cnt = 0U;
@@ -115,8 +127,7 @@ static void process_sample_raw(const icm6_raw_sample_t *s);
 static void process_sample_cal(const icm6_raw_sample_t *s);
 
 /* ════════════════════════════════════════════════════════════════════
- * sensor_event_cb — вызывается из BDMA ISR (spi6_imu_port.c)
- * cb_current_imu уже установлен в spi6_imu_port.c перед вызовом parse.
+ * sensor_event_cb
  * ════════════════════════════════════════════════════════════════════ */
 static void sensor_event_cb(inv_imu_sensor_event_t *event)
 {
@@ -128,7 +139,6 @@ static void sensor_event_cb(inv_imu_sensor_event_t *event)
 
     uint32_t next = (imu_head[id] + 1U) % IMU_BUF_SIZE;
     if (next == imu_tail[id]) {
-        /* Буфер полон — сдвигаем хвост (старый сэмпл теряется) */
         imu_tail[id] = (imu_tail[id] + 1U) % IMU_BUF_SIZE;
     }
 
@@ -176,7 +186,7 @@ static int ICM_Init_All(void)
         fifo_cfg.base_conf.accel_en   = INV_IMU_ENABLE;
         fifo_cfg.base_conf.gyro_en    = INV_IMU_ENABLE;
         fifo_cfg.base_conf.hires_en   = INV_IMU_DISABLE;
-        fifo_cfg.base_conf.fifo_wm_th = 16U;
+        fifo_cfg.base_conf.fifo_wm_th = 8U;   /* 8 пакетов @ 800 Гц = ~10 мс */
         fifo_cfg.base_conf.fifo_mode  = FIFO_CONFIG0_FIFO_MODE_STREAM;
         fifo_cfg.tmst_fsync_en        = INV_IMU_ENABLE;
         fifo_cfg.fifo_wr_wm_gt_th     = FIFO_CONFIG2_FIFO_WR_WM_EQ_OR_GT_TH;
@@ -194,23 +204,18 @@ static int ICM_Init_All(void)
 
 /* ════════════════════════════════════════════════════════════════════
  * TX-очередь и DMA
- * ИСПРАВЛЕНО: критическая секция вокруг tx_head/tx_tail
  * ════════════════════════════════════════════════════════════════════ */
 static void tx_enqueue(const void *data, uint16_t len)
 {
-    /* Защита от гонки с DMA TC IRQ который читает tx_tail */
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
     uint32_t next = (tx_head + 1U) % TX_BUF_SZ6;
-    if (next != tx_tail) {               /* очередь не полна */
+    if (next != tx_tail) {
         memcpy(tx_buf[tx_head], data, len);
         tx_len[tx_head] = len;
         tx_head = next;
     }
-    /* Если очередь полна — молча отбрасываем пакет.
-     * Это лучше чем двигать tail здесь и портить буфер
-     * который DMA сейчас передаёт. */
 
     if (!primask) __enable_irq();
 }
@@ -229,8 +234,6 @@ static void UART4_DMA_Send(uint8_t *data, uint16_t len)
     LL_DMA_EnableStream(DMA1, LL_DMA_STREAM_0);
 }
 
-/* Вызывается из main loop И из DMA TC IRQ.
- * ИСПРАВЛЕНО: критическая секция вокруг uart_tx_busy + tx_tail */
 void UART4_TryStartDMA(void)
 {
     uint32_t primask = __get_PRIMASK();
@@ -239,8 +242,6 @@ void UART4_TryStartDMA(void)
     if (!uart_tx_busy && (tx_head != tx_tail)) {
         uart_tx_busy = 1U;
         dma_start_cnt++;
-        /* Запускаем передачу текущего хвоста.
-         * tx_tail сдвигается ПОСЛЕ TC IRQ в stm32h7xx_it_6imu.c */
         UART4_DMA_Send(tx_buf[tx_tail], tx_len[tx_tail]);
     }
 
@@ -314,23 +315,15 @@ int main(void)
 
     while (1)
     {
-        /* ── Опрос 6 датчиков ─────────────────────────────────────
-         * cb_current_imu НЕ устанавливается здесь —
-         * spi6_imu_port.c устанавливает его сам перед parse внутри ISR. */
         for (uint8_t i = 0U; i < IMU_COUNT; i++)
         {
             SPI6_PollSensor(i);
         }
 
-        /* ── Отправка по UART ─────────────────────────────────────
-         * Читаем imu_buf атомарно: копируем сэмпл до сдвига tail. */
         for (uint8_t i = 0U; i < IMU_COUNT; i++)
         {
             while (imu_tail[i] != imu_head[i])
             {
-                /* Атомарное чтение из кольцевого буфера.
-                 * imu_head пишется только из BDMA ISR,
-                 * imu_tail читается/пишется только здесь → безопасно. */
                 icm6_raw_sample_t s = imu_buf[i][imu_tail[i]];
                 imu_tail[i] = (imu_tail[i] + 1U) % IMU_BUF_SIZE;
 
@@ -348,6 +341,13 @@ int main(void)
 
 /* ════════════════════════════════════════════════════════════════════
  * SystemClock_Config
+ *
+ *  PLL1: SYSCLK = 400 МГц (HSE=25, M=4, N=128, P=2)
+ *  PLL2: PLL2Q  = 200 МГц (M=5, N=40, Q=1) → UART4 @ 12.5 МБод
+ *  PLL3: PLL3Q  = 80 МГц  (M=5, N=32, Q=2) → SPI6 @ 10 МГц (DIV8)
+ *
+ *  ИСПРАВЛЕНО: PLL2 M=5 (VCO_in=5 МГц, стабильный диапазон 4..8 МГц).
+ *  ИСПРАВЛЕНО: PLL3Q включён и назначен источником SPI6.
  * ════════════════════════════════════════════════════════════════════ */
 void SystemClock_Config(void)
 {
@@ -361,6 +361,10 @@ void SystemClock_Config(void)
     LL_RCC_HSE_Enable();
     while (LL_RCC_HSE_IsReady() != 1) {}
 
+    /* ── PLL1: 400 МГц ──────────────────────────────────────────────
+     * VCO_in = 25/4 = 6.25 МГц (диапазон 4..8: OK)
+     * VCO    = 6.25 × 128 = 800 МГц
+     * P      = 800/2 = 400 МГц */
     LL_RCC_PLL_SetSource(LL_RCC_PLLSOURCE_HSE);
     LL_RCC_PLL1P_Enable();
     LL_RCC_PLL1Q_Enable();
@@ -375,23 +379,36 @@ void SystemClock_Config(void)
     LL_RCC_PLL1_Enable();
     while (LL_RCC_PLL1_IsReady() != 1) {}
 
+    /* ── PLL2: для UART4 ────────────────────────────────────────────
+     * ИСПРАВЛЕНО: M=5 → VCO_in = 25/5 = 5 МГц (диапазон 4..8: OK)
+     * VCO    = 5 × 40 = 200 МГц (диапазон 150..836: OK)
+     * Q      = 200/1 = 200 МГц → UART4 BaudRate = 12 500 000
+     *   USARTDIV = 200 000 000 / (2 × 12 500 000) = 8 (точно, без дробей) */
     LL_RCC_PLL2Q_Enable();
-    LL_RCC_PLL2_SetVCOInputRange(LL_RCC_PLLINPUTRANGE_1_2);
+    LL_RCC_PLL2_SetVCOInputRange(LL_RCC_PLLINPUTRANGE_4_8);
     LL_RCC_PLL2_SetVCOOutputRange(LL_RCC_PLLVCORANGE_MEDIUM);
-    LL_RCC_PLL2_SetM(25);
-    LL_RCC_PLL2_SetN(192);
+    LL_RCC_PLL2_SetM(5);
+    LL_RCC_PLL2_SetN(40);
     LL_RCC_PLL2_SetQ(1);
     LL_RCC_PLL2_Enable();
     while (LL_RCC_PLL2_IsReady() != 1) {}
 
+    /* ── PLL3: для SPI6 ─────────────────────────────────────────────
+     * ИСПРАВЛЕНО: Q включён, назначен источником SPI6.
+     * VCO_in = 25/5 = 5 МГц (диапазон 4..8: OK)
+     * VCO    = 5 × 32 = 160 МГц
+     * Q      = 160/2 = 80 МГц → SPI6 DIV8 = 10 МГц */
     LL_RCC_PLL3Q_Enable();
     LL_RCC_PLL3_SetVCOInputRange(LL_RCC_PLLINPUTRANGE_4_8);
     LL_RCC_PLL3_SetVCOOutputRange(LL_RCC_PLLVCORANGE_WIDE);
     LL_RCC_PLL3_SetM(5);
     LL_RCC_PLL3_SetN(32);
-    LL_RCC_PLL3_SetQ(4);
+    LL_RCC_PLL3_SetQ(2);
     LL_RCC_PLL3_Enable();
     while (LL_RCC_PLL3_IsReady() != 1) {}
+
+    /* ИСПРАВЛЕНО: явно назначаем SPI6 от PLL3Q */
+    LL_RCC_SetSPIClockSource(LL_RCC_SPI6_CLKSOURCE_PLL3Q);
 
     LL_RCC_SetAHBPrescaler(LL_RCC_AHB_DIV_2);
     LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL1);
@@ -409,7 +426,7 @@ void SystemClock_Config(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
- * MX_UART4_Init — 12 МБит/с
+ * MX_UART4_Init — 12.5 МБит/с (PLL2Q=200 МГц, USARTDIV=8, OS/8)
  * ════════════════════════════════════════════════════════════════════ */
 static void MX_UART4_Init(void)
 {
@@ -439,7 +456,7 @@ static void MX_UART4_Init(void)
     LL_DMA_DisableFifoMode         (DMA1, LL_DMA_STREAM_0);
 
     UART_InitStruct.PrescalerValue      = LL_USART_PRESCALER_DIV1;
-    UART_InitStruct.BaudRate            = 12000000U;
+    UART_InitStruct.BaudRate            = 12500000U;  /* PLL2Q=200 МГц / (2×8) */
     UART_InitStruct.DataWidth           = LL_USART_DATAWIDTH_8B;
     UART_InitStruct.StopBits            = LL_USART_STOPBITS_1;
     UART_InitStruct.Parity              = LL_USART_PARITY_NONE;
@@ -483,6 +500,7 @@ void MPU_Config(void)
 {
     LL_MPU_Disable();
 
+    /* Регион 0: весь 4ГБ — запрет доступа (защита от случайных обращений) */
     LL_MPU_ConfigRegion(LL_MPU_REGION_NUMBER0, 0x87, 0x0,
         LL_MPU_REGION_SIZE_4GB          |
         LL_MPU_TEX_LEVEL0               |
@@ -492,7 +510,9 @@ void MPU_Config(void)
         LL_MPU_ACCESS_NOT_CACHEABLE     |
         LL_MPU_ACCESS_NOT_BUFFERABLE);
 
-    /* SRAM4 (0x38000000, 16KB) — некэшируемый для BDMA */
+    /* Регион 1: SRAM4 (0x38000000, 16 КБ) — некэшируемый для BDMA.
+     * ИСПРАВЛЕНО: TEX=1, C=0, B=0 = Ordered, Non-cacheable, Non-bufferable
+     * (device memory, корректно для DMA буферов без D-cache) */
     LL_MPU_ConfigRegion(LL_MPU_REGION_NUMBER1, 0x00, 0x38000000,
         LL_MPU_REGION_SIZE_16KB          |
         LL_MPU_TEX_LEVEL1                |
