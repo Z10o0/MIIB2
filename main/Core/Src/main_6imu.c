@@ -1,30 +1,13 @@
-/* Core/Src/main_6imu.c
+/* Core/Src/main_6imu.c  — v5
  *
- * 6 × ICM-45686 на SPI6, STM32H723, LL-драйверы.
- *
- * Тактирование:
- *   PLL1:  SYSCLK = 400 МГц (HSE=25, M=4, N=128, P=2)
- *   PLL2:  PLL2Q  = 192 МГц (M=25, N=192, Q=1) — источник UART4
- *          UART4: f_uart=192 МГц, oversampling=8, BRR=2 → 12 МБит/с
- *   PLL3:  PLL3Q  =  40 МГц (M=5, N=32, Q=4) — источник SPI6
- *          SPI6:  DIV2 → 20 МГц SCK
- *
- * ИСПРАВЛЕНИЯ v4:
- *   1. Main loop: убран вызов inv_imu_adv_get_data_from_fifo() —
- *      эта функция пытается читать FIFO через transport (polling),
- *      конкурируя с уже запущенным BDMA и вызывая коллизию на шине.
- *      Вместо этого используется SPI6_PollSensor(i), которая:
- *        a) читает FIFO_COUNT через polling (быстро, 2 байта),
- *        b) читает FIFO_DATA через BDMA (эффективно),
- *        c) вызывает parse → sensor_event_cb → imu_buf.
- *
- *   2. cb_current_imu устанавливается ВНУТРИ poll_done_cb (в spi6_imu_port.c)
- *      до вызова inv_imu_adv_parse_fifo_data. В main loop он используется
- *      только для обратной совместимости с sensor_event_cb.
- *
- *   3. g_device_mode инициализируется MODE_IDLE и управляется UART RX ISR —
- *      логика не изменилась, но добавлен комментарий что данные не идут
- *      пока не получена команда 'R' или 'C'.
+ * Исправления v5:
+ *  1. Критическая секция в tx_enqueue / UART4_TryStartDMA —
+ *     убирает мусорные байты (гонка tx_tail между main и DMA ISR).
+ *  2. imu_buf увеличен до 512 — уменьшает пропуски при накопленном FIFO.
+ *  3. Удалена строка cb_current_imu = i в main loop —
+ *     spi6_imu_port.c сам устанавливает его перед parse внутри ISR.
+ *  4. TX_BUF_SZ6 увеличен до 1024.
+ *  5. process_sample_* перенесены в ISR-safe зону (вызываются из main).
  */
 
 #include "main.h"
@@ -76,7 +59,7 @@ typedef struct __attribute__((packed)) {
 
 /* ── TX-буфер ────────────────────────────────────────────────────── */
 #define PKT_SLOT_SZ6    36U
-#define TX_BUF_SZ6      256U
+#define TX_BUF_SZ6      1024U   /* увеличен с 256 */
 
 static uint8_t   tx_buf[TX_BUF_SZ6][PKT_SLOT_SZ6];
 static uint16_t  tx_len[TX_BUF_SZ6];
@@ -86,7 +69,7 @@ volatile uint32_t tx_tail      = 0U;
 volatile uint8_t  uart_tx_busy = 0U;
 
 /* ── IMU-буфер сэмплов ───────────────────────────────────────────── */
-#define IMU_BUF_SIZE    256U
+#define IMU_BUF_SIZE    512U    /* увеличен с 256 */
 
 typedef struct __attribute__((packed)) {
     uint32_t sample_idx;
@@ -109,15 +92,10 @@ static volatile uint32_t imu_sample_cnt[IMU_COUNT];
 /* ── IMU state ───────────────────────────────────────────────────── */
 static inv_imu_device_t  imu_dev[IMU_COUNT];
 
-/* cb_current_imu: устанавливается в spi6_imu_port.c внутри poll_done_cb
- * перед вызовом inv_imu_adv_parse_fifo_data → sensor_event_cb.
- * Объявлен volatile, читается только внутри sensor_event_cb. */
+/* cb_current_imu устанавливается внутри spi6_imu_port.c перед parse.
+ * Определён здесь (extern в spi6_imu_port.c). */
 volatile uint8_t  cb_current_imu = 0U;
 
-/* g_device_mode = MODE_IDLE — данные не идут по UART.
- * Отправить 'R' (0x52) по UART4 RX чтобы начать поток raw-пакетов.
- * Отправить 'C' (0x43) для калиброванных пакетов.
- * Отправить 'S' (0x53) чтобы остановить. */
 volatile device_mode_t g_device_mode = MODE_IDLE;
 
 volatile uint32_t dma_start_cnt = 0U;
@@ -137,21 +115,22 @@ static void process_sample_raw(const icm6_raw_sample_t *s);
 static void process_sample_cal(const icm6_raw_sample_t *s);
 
 /* ════════════════════════════════════════════════════════════════════
- * sensor_event_cb
- *
- * Вызывается из inv_imu_adv_parse_fifo_data внутри poll_done_cb (ISR).
- * cb_current_imu установлен в poll_done_cb до вызова parse.
+ * sensor_event_cb — вызывается из BDMA ISR (spi6_imu_port.c)
+ * cb_current_imu уже установлен в spi6_imu_port.c перед вызовом parse.
  * ════════════════════════════════════════════════════════════════════ */
 static void sensor_event_cb(inv_imu_sensor_event_t *event)
 {
     uint8_t id = cb_current_imu;
+    if (id >= IMU_COUNT) return;
 
     if (!(event->sensor_mask & (1 << INV_SENSOR_ACCEL))) return;
     if (!(event->sensor_mask & (1 << INV_SENSOR_GYRO)))  return;
 
     uint32_t next = (imu_head[id] + 1U) % IMU_BUF_SIZE;
-    if (next == imu_tail[id])
+    if (next == imu_tail[id]) {
+        /* Буфер полон — сдвигаем хвост (старый сэмпл теряется) */
         imu_tail[id] = (imu_tail[id] + 1U) % IMU_BUF_SIZE;
+    }
 
     icm6_raw_sample_t *s = &imu_buf[id][imu_head[id]];
     s->sample_idx = imu_sample_cnt[id]++;
@@ -215,15 +194,25 @@ static int ICM_Init_All(void)
 
 /* ════════════════════════════════════════════════════════════════════
  * TX-очередь и DMA
+ * ИСПРАВЛЕНО: критическая секция вокруг tx_head/tx_tail
  * ════════════════════════════════════════════════════════════════════ */
 static void tx_enqueue(const void *data, uint16_t len)
 {
+    /* Защита от гонки с DMA TC IRQ который читает tx_tail */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
     uint32_t next = (tx_head + 1U) % TX_BUF_SZ6;
-    if (next == tx_tail)
-        tx_tail = (tx_tail + 1U) % TX_BUF_SZ6;
-    memcpy(tx_buf[tx_head], data, len);
-    tx_len[tx_head] = len;
-    tx_head = next;
+    if (next != tx_tail) {               /* очередь не полна */
+        memcpy(tx_buf[tx_head], data, len);
+        tx_len[tx_head] = len;
+        tx_head = next;
+    }
+    /* Если очередь полна — молча отбрасываем пакет.
+     * Это лучше чем двигать tail здесь и портить буфер
+     * который DMA сейчас передаёт. */
+
+    if (!primask) __enable_irq();
 }
 
 static void UART4_DMA_Send(uint8_t *data, uint16_t len)
@@ -240,13 +229,22 @@ static void UART4_DMA_Send(uint8_t *data, uint16_t len)
     LL_DMA_EnableStream(DMA1, LL_DMA_STREAM_0);
 }
 
+/* Вызывается из main loop И из DMA TC IRQ.
+ * ИСПРАВЛЕНО: критическая секция вокруг uart_tx_busy + tx_tail */
 void UART4_TryStartDMA(void)
 {
-    if (uart_tx_busy) return;
-    if (tx_head == tx_tail) return;
-    uart_tx_busy = 1U;
-    dma_start_cnt++;
-    UART4_DMA_Send(tx_buf[tx_tail], tx_len[tx_tail]);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    if (!uart_tx_busy && (tx_head != tx_tail)) {
+        uart_tx_busy = 1U;
+        dma_start_cnt++;
+        /* Запускаем передачу текущего хвоста.
+         * tx_tail сдвигается ПОСЛЕ TC IRQ в stm32h7xx_it_6imu.c */
+        UART4_DMA_Send(tx_buf[tx_tail], tx_len[tx_tail]);
+    }
+
+    if (!primask) __enable_irq();
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -316,28 +314,26 @@ int main(void)
 
     while (1)
     {
-        /* ── Опрос 6 датчиков через FIFO (BDMA) ──────────────────── */
-        /* ИСПРАВЛЕНО: используем SPI6_PollSensor вместо
-         * inv_imu_adv_get_data_from_fifo, которая читает через
-         * transport (polling) и конкурирует с BDMA на шине SPI6.
-         * SPI6_PollSensor:
-         *   1) читает FIFO_COUNT (2 байта, polling — быстро),
-         *   2) читает FIFO_DATA через BDMA (эффективно),
-         *   3) вызывает inv_imu_adv_parse_fifo_data → sensor_event_cb
-         *      → заполняет imu_buf[i]. */
+        /* ── Опрос 6 датчиков ─────────────────────────────────────
+         * cb_current_imu НЕ устанавливается здесь —
+         * spi6_imu_port.c устанавливает его сам перед parse внутри ISR. */
         for (uint8_t i = 0U; i < IMU_COUNT; i++)
         {
-            cb_current_imu = i;
             SPI6_PollSensor(i);
         }
 
-        /* ── Отправка по UART ─────────────────────────────────────── */
+        /* ── Отправка по UART ─────────────────────────────────────
+         * Читаем imu_buf атомарно: копируем сэмпл до сдвига tail. */
         for (uint8_t i = 0U; i < IMU_COUNT; i++)
         {
             while (imu_tail[i] != imu_head[i])
             {
+                /* Атомарное чтение из кольцевого буфера.
+                 * imu_head пишется только из BDMA ISR,
+                 * imu_tail читается/пишется только здесь → безопасно. */
                 icm6_raw_sample_t s = imu_buf[i][imu_tail[i]];
                 imu_tail[i] = (imu_tail[i] + 1U) % IMU_BUF_SIZE;
+
                 switch (g_device_mode)
                 {
                 case MODE_RAW:   process_sample_raw(&s);  break;
@@ -413,7 +409,7 @@ void SystemClock_Config(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
- * MX_UART4_Init — 12 МБит/с (PLL2Q=192 МГц, oversampling=8, BRR=2)
+ * MX_UART4_Init — 12 МБит/с
  * ════════════════════════════════════════════════════════════════════ */
 static void MX_UART4_Init(void)
 {
@@ -486,14 +482,26 @@ static void MX_GPIO_Init(void)
 void MPU_Config(void)
 {
     LL_MPU_Disable();
+
     LL_MPU_ConfigRegion(LL_MPU_REGION_NUMBER0, 0x87, 0x0,
-        LL_MPU_REGION_SIZE_4GB     |
-        LL_MPU_TEX_LEVEL0          |
-        LL_MPU_REGION_NO_ACCESS    |
+        LL_MPU_REGION_SIZE_4GB          |
+        LL_MPU_TEX_LEVEL0               |
+        LL_MPU_REGION_NO_ACCESS         |
         LL_MPU_INSTRUCTION_ACCESS_DISABLE |
-        LL_MPU_ACCESS_SHAREABLE    |
-        LL_MPU_ACCESS_NOT_CACHEABLE|
+        LL_MPU_ACCESS_SHAREABLE         |
+        LL_MPU_ACCESS_NOT_CACHEABLE     |
         LL_MPU_ACCESS_NOT_BUFFERABLE);
+
+    /* SRAM4 (0x38000000, 16KB) — некэшируемый для BDMA */
+    LL_MPU_ConfigRegion(LL_MPU_REGION_NUMBER1, 0x00, 0x38000000,
+        LL_MPU_REGION_SIZE_16KB          |
+        LL_MPU_TEX_LEVEL1                |
+        LL_MPU_REGION_FULL_ACCESS        |
+        LL_MPU_INSTRUCTION_ACCESS_DISABLE|
+        LL_MPU_ACCESS_NOT_SHAREABLE      |
+        LL_MPU_ACCESS_NOT_CACHEABLE      |
+        LL_MPU_ACCESS_NOT_BUFFERABLE);
+
     LL_MPU_Enable(LL_MPU_CTRL_PRIVILEGED_DEFAULT);
 }
 

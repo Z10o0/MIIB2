@@ -12,10 +12,8 @@ Core/Src/spi6_imu_port.o: ../Core/Src/spi6_imu_port.c \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_gpio.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_rcc.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_bus.h \
- ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h \
- ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h \
- ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_bdma.h \
+ ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h \
  C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_driver.h \
  C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_defs.h \
  C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu.h \
@@ -23,6 +21,8 @@ Core/Src/spi6_imu_port.o: ../Core/Src/spi6_imu_port.c \
  C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_transport.h \
  C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_driver_advanced.h \
  ../Core/Inc/main.h \
+ ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h \
+ ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_crs.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_system.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_exti.h \
@@ -45,10 +45,8 @@ Core/Src/spi6_imu_port.o: ../Core/Src/spi6_imu_port.c \
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_gpio.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_rcc.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_bus.h:
-../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:
-../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h:
-../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_bdma.h:
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h:
 C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_driver.h:
 C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_defs.h:
 C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu.h:
@@ -56,6 +54,8 @@ C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанны�
 C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_transport.h:
 C:/Users/17082/OneDrive/Рабочий\ стол/Нужные\ скачанные\ файлики\ для\ STM32H723/MIIB\ GIT\ Первая\ попытка\ в\ 6\ датчиков\ на\ одном\ SPI/MIIB/main/Drivers/icm45686/imu/inv_imu_driver_advanced.h:
 ../Core/Inc/main.h:
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dma.h:
+../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_dmamux.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_crs.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_system.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_exti.h:
